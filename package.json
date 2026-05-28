@@ -1,0 +1,8 @@
+{
+  "name": "motonuvem-mirror-worker",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "GitHub Actions worker para espelhar arquivos grandes (Drive → Pixeldrain) sem timeout.",
+  "engines": { "node": ">=20" }
+}

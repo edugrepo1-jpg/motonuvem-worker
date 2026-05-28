@@ -1,0 +1,32 @@
+name: mirror
+
+on:
+  repository_dispatch:
+    types: [mirror]
+  workflow_dispatch:
+    inputs:
+      mirror_id:    { description: "mirror_id (uuid)",    required: true }
+      source_url:   { description: "URL de origem",        required: true }
+      file_name:    { description: "Nome do arquivo",      required: true }
+      callback_url: { description: "URL de callback",      required: true }
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Run mirror job
+        env:
+          MIRROR_ID:          ${{ github.event.client_payload.mirror_id   || inputs.mirror_id }}
+          SOURCE_URL:         ${{ github.event.client_payload.source_url  || inputs.source_url }}
+          FILE_NAME:          ${{ github.event.client_payload.file_name   || inputs.file_name }}
+          CALLBACK_URL:       ${{ github.event.client_payload.callback_url|| inputs.callback_url }}
+          CALLBACK_TOKEN:     ${{ secrets.CALLBACK_TOKEN }}
+          PIXELDRAIN_API_KEY: ${{ secrets.PIXELDRAIN_API_KEY }}
+        run: node scripts/mirror.mjs

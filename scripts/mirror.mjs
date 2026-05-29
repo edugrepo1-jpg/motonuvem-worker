@@ -9,7 +9,7 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 
 const {
-  MIRROR_ID, SOURCE_URL, FILE_NAME, CALLBACK_URL,
+  MIRROR_ID, SOURCE_URL, FILE_NAME, FILE_SIZE, CALLBACK_URL,
   CALLBACK_TOKEN, PIXELDRAIN_API_KEY,
 } = process.env;
 
@@ -42,7 +42,42 @@ async function callback(payload) {
 }
 
 // --- Google Drive público (porta da lógica que existe na edge function) ---
-function decodeHtmlUrl(v) { return v.replace(/&amp;/g, "&").replace(/&#34;/g, '"').replace(/&quot;/g, '"'); }
+function decodeHtmlUrl(v) {
+  return String(v || "")
+    .replace(/&amp;/g, "&")
+    .replace(/&#34;/g, '"')
+    .replace(/&quot;/g, '"')
+    .replace(/\\u003d/gi, "=")
+    .replace(/\\u0026/gi, "&")
+    .replace(/\\\//g, "/");
+}
+function htmlAttr(tag, name) {
+  const re = new RegExp(`${name}=["']([^"']*)["']`, "i");
+  return decodeHtmlUrl(re.exec(tag)?.[1] || "") || null;
+}
+function isHtmlContentType(ct) {
+  return /(?:^|;)\s*(?:text\/html|application\/xhtml\+xml)/i.test(ct || "");
+}
+async function assertBinaryResponse(res, context) {
+  const reader = res.body?.getReader?.();
+  if (!reader) throw new Error(`${context}: resposta sem stream`);
+  const first = await reader.read();
+  if (first.done || !first.value?.length) throw new Error(`${context}: resposta vazia`);
+  const sniff = new TextDecoder().decode(first.value.subarray(0, Math.min(first.value.length, 768))).trimStart().toLowerCase();
+  if (sniff.startsWith("<!doctype html") || sniff.startsWith("<html") || sniff.startsWith("<head") || (sniff.startsWith("<?xml") && sniff.includes("html"))) {
+    try { await reader.cancel(); } catch {}
+    throw new Error(`${context}: URL devolveu HTML (login/aviso)`);
+  }
+  return new ReadableStream({
+    start(controller) { controller.enqueue(first.value); },
+    async pull(controller) {
+      const next = await reader.read();
+      if (next.done) return controller.close();
+      controller.enqueue(next.value);
+    },
+    cancel(reason) { try { reader.cancel(reason); } catch {} },
+  });
+}
 function browserHeaders(extra = {}) {
   return {
     "User-Agent": UA,
@@ -52,12 +87,26 @@ function browserHeaders(extra = {}) {
   };
 }
 
-function extractDriveFileId(url) {
+function extractPixeldrainFileId(url) {
+  try {
+    const u = new URL(url);
+    if (!/^pixeldrain\.(com|dev)$/i.test(u.hostname)) return null;
+    const m = /^\/(?:u|d|api\/file)\/([A-Za-z0-9]+)/i.exec(u.pathname);
+    return m?.[1] || null;
+  } catch {
+    const m = /^https?:\/\/pixeldrain\.(?:com|dev)\/(?:u|d|api\/file)\/([A-Za-z0-9]+)/i.exec(url);
+    return m?.[1] || null;
+  }
+}
+
+function extractDriveInfo(url) {
   try {
     const u = new URL(url);
     if (!u.hostname.includes("drive.google.com") && !u.hostname.includes("drive.usercontent.google.com")) return null;
     const m = /\/file\/d\/([^/?#]+)/.exec(u.pathname);
-    return m?.[1] || u.searchParams.get("id") || null;
+    const fileId = m?.[1] || u.searchParams.get("id");
+    if (!fileId) return null;
+    return { fileId, resourceKey: u.searchParams.get("resourcekey") || undefined };
   } catch { return null; }
 }
 
@@ -89,63 +138,97 @@ async function fetchWithCookies(url, jar, headers = {}) {
   throw new Error("muitos redirects");
 }
 
-async function openDrivePublic(fileId) {
+function drivePublicUrl(fileId, resourceKey, confirm) {
+  const params = new URLSearchParams({ export: "download", id: fileId });
+  if (confirm) params.set("confirm", confirm);
+  if (resourceKey) params.set("resourcekey", resourceKey);
+  return `https://drive.google.com/uc?${params}`;
+}
+function driveCandidates(html, fileId, resourceKey) {
+  const out = new Set();
+  const add = (u) => { if (u) out.add(u); };
+  for (const form of html.matchAll(/<form\b[^>]*>[\s\S]*?<\/form>/gi)) {
+    const formHtml = form[0];
+    const action = htmlAttr(formHtml, "action");
+    if (!action) continue;
+    const params = new URLSearchParams();
+    for (const input of formHtml.matchAll(/<input\b[^>]*>/gi)) {
+      const name = htmlAttr(input[0], "name");
+      if (name) params.set(name, htmlAttr(input[0], "value") || "");
+    }
+    if (!params.has("id")) params.set("id", fileId);
+    if (resourceKey && !params.has("resourcekey")) params.set("resourcekey", resourceKey);
+    add(`${new URL(action, "https://drive.google.com").toString()}?${params}`);
+  }
+  const confirm = /name=["']confirm["']\s+value=["']([^"']+)/i.exec(html)?.[1]
+    || /[?&]confirm=([^&"']+)/i.exec(html)?.[1]
+    || /download_warning[^=]*=([^;"'&]+)/i.exec(html)?.[1];
+  if (confirm) add(drivePublicUrl(fileId, resourceKey, decodeURIComponent(confirm)));
+  add(drivePublicUrl(fileId, resourceKey, "t"));
+  add(`https://drive.usercontent.google.com/download?id=${encodeURIComponent(fileId)}&export=download&confirm=t${resourceKey ? `&resourcekey=${encodeURIComponent(resourceKey)}` : ""}`);
+  for (const m of html.matchAll(/href=["']([^"']*(?:drive\.google\.com\/uc|drive\.usercontent\.google\.com\/download)[^"']*)["']/gi)) {
+    add(new URL(decodeHtmlUrl(m[1]), "https://drive.google.com").toString());
+  }
+  const downloadUrl = /downloadUrl["']?\s*:\s*["']([^"']+)/i.exec(html)?.[1];
+  if (downloadUrl) add(decodeHtmlUrl(downloadUrl));
+  return [...out];
+}
+async function openDrivePublic(fileId, resourceKey) {
   const jar = new Map();
-  let url = `https://drive.google.com/uc?export=download&id=${fileId}`;
-  for (let attempt = 0; attempt < 4; attempt++) {
+  let url = drivePublicUrl(fileId, resourceKey);
+  const tried = new Set();
+  for (let attempt = 0; attempt < 8; attempt++) {
     const res = await fetchWithCookies(url, jar);
     const ct = res.headers.get("content-type") || "";
-    if (!ct.includes("text/html")) {
-      const cl = Number(res.headers.get("content-length") || 0);
+    if (res.ok && !isHtmlContentType(ct)) {
+      const cl = Number(res.headers.get("content-length") || res.headers.get("x-goog-stored-content-length") || FILE_SIZE || 0);
       const cd = res.headers.get("content-disposition");
       let fname = FILE_NAME;
       if (cd) {
         const m = /filename\*?=(?:UTF-8'')?["']?([^"';]+)/i.exec(cd);
         if (m) fname = decodeURIComponent(m[1]);
       }
-      return { stream: res.body, contentLength: cl, contentType: ct || "application/octet-stream", fileName: fname };
+      return { stream: await assertBinaryResponse(res, "Drive público"), contentLength: cl, contentType: ct || "application/octet-stream", fileName: fname };
     }
-    // html → procura link de confirmação
     const html = await res.text();
-    const formMatch = /<form[^>]+id="download-form"[^>]+action="([^"]+)"/i.exec(html);
-    if (formMatch) {
-      const action = decodeHtmlUrl(formMatch[1]);
-      const params = new URLSearchParams();
-      const fieldRe = /<input[^>]+name="([^"]+)"[^>]+value="([^"]*)"/gi;
-      let m;
-      while ((m = fieldRe.exec(html))) params.set(m[1], decodeHtmlUrl(m[2]));
-      url = `${action}?${params.toString()}`;
-      continue;
-    }
-    const confirmMatch = /confirm=([0-9A-Za-z_]+)/.exec(html);
-    if (confirmMatch) {
-      url = `https://drive.google.com/uc?export=download&confirm=${confirmMatch[1]}&id=${fileId}`;
-      continue;
-    }
-    throw new Error("Drive devolveu HTML sem link de confirmação (arquivo provavelmente não é público)");
+    const next = driveCandidates(html, fileId, resourceKey).find((u) => !tried.has(u));
+    if (!next) throw new Error("Drive devolveu HTML sem link de confirmação (arquivo provavelmente não é público ou excedeu quota)");
+    tried.add(next);
+    url = next;
   }
-  throw new Error("Drive: muitas tentativas de confirmação");
+  throw new Error("Drive público continuou retornando HTML em vez do arquivo");
 }
 
 async function openHttp(url) {
-  const res = await fetch(url, { redirect: "follow", headers: browserHeaders() });
+  const pdId = extractPixeldrainFileId(url);
+  const fetchUrl = pdId ? `${PIXELDRAIN_BASE}/api/file/${pdId}` : url;
+  const auth = Buffer.from(`:${PIXELDRAIN_API_KEY}`).toString("base64");
+  let pdInfo = null;
+  if (pdId) {
+    const infoRes = await fetch(`${PIXELDRAIN_BASE}/api/file/${pdId}/info`, { headers: { Authorization: `Basic ${auth}` } });
+    if (infoRes.ok) pdInfo = await infoRes.json().catch(() => null);
+  }
+  const res = await fetch(fetchUrl, {
+    redirect: "follow",
+    headers: { ...browserHeaders({ Accept: "*/*" }), ...(pdId ? { Authorization: `Basic ${auth}` } : {}) },
+  });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const ct = res.headers.get("content-type") || "application/octet-stream";
-  if (ct.includes("text/html")) {
+  if (isHtmlContentType(ct)) {
     try { await res.body?.cancel?.(); } catch {}
     throw new Error("URL devolveu HTML (login/aviso)");
   }
   return {
-    stream: res.body,
-    contentLength: Number(res.headers.get("content-length") || 0),
-    contentType: ct,
-    fileName: FILE_NAME,
+    stream: await assertBinaryResponse(res, pdId ? "Pixeldrain" : "download"),
+    contentLength: Number(pdInfo?.size || res.headers.get("content-length") || FILE_SIZE || 0),
+    contentType: pdInfo?.mime_type || ct,
+    fileName: pdInfo?.name || FILE_NAME,
   };
 }
 
 async function openSource() {
-  const driveId = extractDriveFileId(SOURCE_URL);
-  if (driveId) return await openDrivePublic(driveId);
+  const drive = extractDriveInfo(SOURCE_URL);
+  if (drive) return await openDrivePublic(drive.fileId, drive.resourceKey);
   return await openHttp(SOURCE_URL);
 }
 

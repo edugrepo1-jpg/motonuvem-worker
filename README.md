@@ -1,36 +1,49 @@
-# motonuvem-mirror-worker
+# MotoNuvem Mirror Worker
 
-Worker rodando em **GitHub Actions** que baixa um arquivo de uma URL pública (Google Drive público, link HTTP direto, etc.) e re-hospeda no **Pixeldrain**. Usado pelo projeto Moto Nuvem pra contornar o timeout de ~400s das Edge Functions em arquivos grandes (>800 MB).
+Worker do GitHub Actions para espelhar arquivos grandes para Pixeldrain sem estourar o timeout do Lovable Cloud.
 
-Este repositório é **público de propósito**: GitHub Actions só dá minutos ilimitados em repos públicos. Não há segredos nem regra de negócio no código — só dois secrets de runtime configurados em **Settings → Secrets and variables → Actions**.
+## Arquivos
 
-## Como funciona
+Copie estes arquivos para a raiz do repositório do worker:
 
-1. A Edge Function `pixeldrain-mirror` no Lovable detecta um arquivo grande.
-2. Dispara este workflow via `POST /repos/{owner}/{repo}/dispatches` com `event_type=mirror` e um payload contendo `mirror_id`, `source_url`, `file_name`, `callback_url`.
-3. O job baixa o arquivo pra `/tmp` do runner, sobe pro Pixeldrain (`PUT /api/file/{name}`) e chama de volta a edge function `pixeldrain-mirror-callback` reportando o `pixeldrain_file_id`.
+- `.github/workflows/mirror.yml`
+- `scripts/mirror.mjs`
+- `package.json`
 
-## Setup (uma vez)
+## Secrets do repositório no GitHub
 
-Em **Settings → Secrets and variables → Actions → New repository secret**, crie:
+Em **Settings → Secrets and variables → Actions → Repository secrets**, crie:
 
-| Nome | Valor |
-|------|-------|
-| `PIXELDRAIN_API_KEY` | Mesma chave da sua conta Pixeldrain (a que já está no Lovable). |
-| `CALLBACK_TOKEN`     | Mesmo valor de `MIRROR_WORKER_CALLBACK_TOKEN` no Lovable. |
+- `PIXELDRAIN_API_KEY`: sua API key do Pixeldrain.
+- `CALLBACK_TOKEN`: o mesmo valor salvo no Lovable Cloud como `MIRROR_WORKER_CALLBACK_TOKEN`.
 
-Pronto. Os arquivos `mirror.yml` e `mirror.mjs` já estão prontos pra rodar.
+## Token usado pelo app para despachar o workflow
 
-## Teste manual
+O secret `GITHUB_DISPATCH_TOKEN` no Lovable Cloud deve ser um Fine-grained PAT com acesso ao repositório do worker e permissões:
 
-Use a aba **Actions → mirror → Run workflow** e passe um `mirror_id` real (uuid existente em `rom_mirrors` no Lovable, com status `dispatched`), uma `source_url` pequena (ex: 50 MB), `file_name` qualquer e a `callback_url`:
+- **Actions: Read and write**
+- **Metadata: Read**
 
+O app usa `workflow_dispatch` no workflow `.github/workflows/mirror.yml`. Se você marcou só **Contents: Read and write**, o GitHub pode responder:
+
+```txt
+Resource not accessible by personal access token
 ```
-https://<seu-project-ref>.supabase.co/functions/v1/pixeldrain-mirror-callback
+
+## Secret do nome do repositório
+
+No Lovable Cloud, `GITHUB_WORKER_REPO` deve estar no formato:
+
+```txt
+usuario-ou-org/nome-do-repo
 ```
 
-## Limites
+Exemplo:
 
-- Timeout do job: 350 min (limite total do GitHub é 360).
-- Disco do runner: ~14 GB livres em `/tmp` (ROMs até ~10 GB cabem sem problema).
-- Paralelismo padrão: até 20 jobs simultâneos por repo no plano free.
+```txt
+motonuvem/motonuvem-mirror-worker
+```
+
+## Teste
+
+Depois de copiar os arquivos e configurar os secrets, vá em **Actions → mirror → Run workflow** no GitHub e confira se o workflow aparece. O app também irá disparar esse workflow automaticamente para arquivos maiores que o limite processável direto pelo Lovable Cloud.

@@ -8,6 +8,7 @@ on:
       mirror_id:    { description: "mirror_id (uuid)",    required: true }
       source_url:   { description: "URL de origem",        required: true }
       file_name:    { description: "Nome do arquivo",      required: true }
+      file_size:    { description: "Tamanho em bytes",     required: false }
       callback_url: { description: "URL de callback",      required: true }
 
 jobs:
@@ -26,6 +27,7 @@ jobs:
           MIRROR_ID:          ${{ github.event.client_payload.mirror_id   || inputs.mirror_id }}
           SOURCE_URL:         ${{ github.event.client_payload.source_url  || inputs.source_url }}
           FILE_NAME:          ${{ github.event.client_payload.file_name   || inputs.file_name }}
+          FILE_SIZE:          ${{ github.event.client_payload.file_size   || inputs.file_size }}
           CALLBACK_URL:       ${{ github.event.client_payload.callback_url|| inputs.callback_url }}
           CALLBACK_TOKEN:     ${{ secrets.CALLBACK_TOKEN }}
           PIXELDRAIN_API_KEY: ${{ secrets.PIXELDRAIN_API_KEY }}

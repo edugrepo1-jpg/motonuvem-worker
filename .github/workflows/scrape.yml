@@ -1,0 +1,34 @@
+name: Scrape Landing (Playwright)
+
+on:
+  workflow_dispatch:
+    inputs:
+      mirror_id:     { description: "UUID do rom_mirrors", required: true }
+      target_url:    { description: "URL da landing page",  required: true }
+      callback_url:  { description: "URL do landing-scrape-callback (Supabase)", required: true }
+      callback_token:{ description: "MIRROR_WORKER_CALLBACK_TOKEN",            required: true }
+
+concurrency:
+  group: scrape-${{ inputs.mirror_id }}
+  cancel-in-progress: true
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: "20" }
+      - name: Install Playwright + Chromium
+        run: |
+          npm init -y >/dev/null 2>&1 || true
+          npm install --no-save playwright@1.48.0
+          npx playwright install --with-deps chromium
+      - name: Render and POST to callback
+        env:
+          MIRROR_ID:      ${{ inputs.mirror_id }}
+          TARGET_URL:     ${{ inputs.target_url }}
+          CALLBACK_URL:   ${{ inputs.callback_url }}
+          CALLBACK_TOKEN: ${{ inputs.callback_token }}
+        run: node "${{ github.workspace }}/scripts/scrape.js"
